@@ -1,0 +1,800 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NOIR MAZE — Granny's House</title>
+  <style>
+    html, body { margin:0; height:100%; background:#000; overflow:hidden; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+    #hud { position:fixed; inset:0; pointer-events:none; color:#d9d9d9; text-shadow: 0 0 12px rgba(0,0,0,.9); }
+    #hint {
+      position:fixed; left:50%; top:50%; transform:translate(-50%,-50%);
+      padding:14px 16px; border:1px solid rgba(255,255,255,.12);
+      border-radius:14px; background:rgba(0,0,0,.55);
+      letter-spacing:.3px; pointer-events:auto;
+      max-width: min(620px, calc(100vw - 28px));
+      text-align:center;
+      user-select:none;
+    }
+    #hint b { color:#fff; }
+    #status {
+      position:fixed; left:12px; top:12px;
+      padding:10px 12px; border-radius:12px;
+      background:rgba(0,0,0,.35); border:1px solid rgba(255,255,255,.10);
+      font-size:14px; line-height:1.35;
+    }
+    #reticle { position:fixed; left:50%; top:50%; width:10px; height:10px; transform:translate(-50%,-50%); opacity:.9; }
+    #reticle:before, #reticle:after {
+      content:""; position:absolute; left:50%; top:50%;
+      width:10px; height:2px; background:rgba(255,255,255,.65);
+      transform:translate(-50%,-50%); border-radius:2px;
+    }
+    #reticle:after { width:2px; height:10px; }
+    #vignette {
+      position:fixed; inset:-2px; pointer-events:none;
+      background: radial-gradient(circle at 50% 50%, rgba(0,0,0,0) 0%, rgba(0,0,0,.55) 55%, rgba(0,0,0,.92) 100%);
+      mix-blend-mode:multiply;
+    }
+    #jumpscare {
+      position:fixed; inset:0; display:none; place-items:center;
+      background:#000; z-index:999;
+    }
+    #jumpscare img {
+      width:min(92vw, 720px); height:auto;
+      image-rendering: pixelated;
+      filter: contrast(1.25) saturate(0.9);
+      transform: scale(1.07);
+    }
+    #jumpscare .glitch {
+      position:absolute; inset:0;
+      background: repeating-linear-gradient(
+        0deg,
+        rgba(255,255,255,0.06) 0px,
+        rgba(255,255,255,0.06) 1px,
+        rgba(0,0,0,0) 3px,
+        rgba(0,0,0,0) 6px
+      );
+      mix-blend-mode: overlay;
+      opacity:.35;
+      animation: scan 90ms infinite linear;
+    }
+    @keyframes scan { from { transform: translateY(0); } to { transform: translateY(6px); } }
+    a { color:#cfcfcf; }
+    .small { font-size: 12px; opacity: .75; }
+  </style>
+
+  <!-- CDN imports (нужен интернет) -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.min.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="hud">
+    <div id="hint">
+      <div style="font-size:16px; margin-bottom:8px;"><b>NOIR MAZE — Granny's House</b></div>
+      <div style="opacity:.9; font-size:14px;">
+        ЛКМ — захват мыши • WASD — ходьба • Shift — бег • Space — прыжок • E — подобрать<br>
+        Цель: собрать <b>3</b> сигила и найти выход.
+      </div>
+      <div class="small" style="margin-top:10px;">
+        Нажми сюда, чтобы начать (звук включится после клика).<br>
+        Модель дома: “granny's house (1.8)” — amogusstrikesback2, CC-BY 4.0 (см. README.txt).
+      </div>
+    </div>
+
+    <div id="status">
+      Сигилы: <span id="sigils">0</span>/3<br>
+      Шаги: <span id="steps">0</span><br>
+      Состояние: <span id="state">загрузка</span>
+    </div>
+
+    <div id="reticle"></div>
+    <div id="vignette"></div>
+  </div>
+
+  <div id="jumpscare">
+    <img id="scareImg" alt="jumpscare" />
+    <div class="glitch"></div>
+  </div>
+
+<script type="module">
+import * as THREE from "three";
+import { PointerLockControls } from "three/addons/controls/PointerLockControls.js";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { Octree } from "three/addons/math/Octree.js";
+import { Capsule } from "three/addons/math/Capsule.js";
+
+/* -----------------------------
+   ASSETS (дом — локально в архиве)
+-------------------------------- */
+const ASSETS = {
+  house: "./assets/house/scene.gltf",
+  // sounds: remote first; fallback synth
+  ambience: "https://opengameart.org/sites/default/files/caverns_0.ogg",
+  scream:   "https://opengameart.org/sites/default/files/scream_horror1_0.mp3",
+  face:     "https://upload.wikimedia.org/wikipedia/commons/7/7f/Evil_pixel_art_face_%28300x300%29.png"
+};
+
+const ui = {
+  hint: document.getElementById("hint"),
+  sigils: document.getElementById("sigils"),
+  steps: document.getElementById("steps"),
+  state: document.getElementById("state"),
+  jumpscare: document.getElementById("jumpscare"),
+  scareImg: document.getElementById("scareImg"),
+};
+const setState = (s) => ui.state.textContent = s;
+
+/* -----------------------------
+   AUDIO (remote -> synth fallback)
+-------------------------------- */
+const audio = {
+  ctx: null,
+  master: null,
+  ambienceNode: null,
+  screamBuf: null,
+  unlocked: false,
+  step: { lastT: 0, walk: 0.44, run: 0.30 }
+};
+
+function initAudio() {
+  audio.ctx = new (window.AudioContext || window.webkitAudioContext)();
+  audio.master = audio.ctx.createGain();
+  audio.master.gain.value = 0.85;
+  audio.master.connect(audio.ctx.destination);
+}
+async function fetchArrayBuffer(url) {
+  const r = await fetch(url, { mode: "cors" });
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return await r.arrayBuffer();
+}
+async function tryLoadAudioBuffer(url) {
+  const ab = await fetchArrayBuffer(url);
+  return await audio.ctx.decodeAudioData(ab);
+}
+function playBuffer(buffer, { loop=false, gain=1.0, playbackRate=1.0 } = {}) {
+  const src = audio.ctx.createBufferSource();
+  src.buffer = buffer;
+  src.loop = loop;
+  src.playbackRate.value = playbackRate;
+  const g = audio.ctx.createGain();
+  g.gain.value = gain;
+  src.connect(g).connect(audio.master);
+  src.start();
+  return { src, gain: g };
+}
+function stopNode(node) { try { node?.src?.stop(); } catch {} }
+
+function startSynthAmbience() {
+  const ctx = audio.ctx;
+  const t = ctx.currentTime;
+
+  const noiseBuf = ctx.createBuffer(1, ctx.sampleRate * 2.0, ctx.sampleRate);
+  const ch = noiseBuf.getChannelData(0);
+  for (let i=0;i<ch.length;i++) ch[i] = (Math.random()*2-1) * 0.6;
+
+  const noise = ctx.createBufferSource();
+  noise.buffer = noiseBuf;
+  noise.loop = true;
+
+  const lp = ctx.createBiquadFilter();
+  lp.type = "lowpass";
+  lp.frequency.value = 420;
+
+  const hp = ctx.createBiquadFilter();
+  hp.type = "highpass";
+  hp.frequency.value = 24;
+
+  const g = ctx.createGain();
+  g.gain.value = 0.22;
+
+  noise.connect(lp).connect(hp).connect(g).connect(audio.master);
+  noise.start(t);
+
+  const rumble = ctx.createOscillator();
+  rumble.type = "sine";
+  rumble.frequency.value = 34;
+
+  const rg = ctx.createGain();
+  rg.gain.value = 0.08;
+
+  rumble.connect(rg).connect(audio.master);
+  rumble.start(t);
+
+  return { stop: () => { try{ noise.stop(); }catch{} try{ rumble.stop(); }catch{} } };
+}
+function playSynthScream() {
+  const ctx = audio.ctx;
+  const t = ctx.currentTime;
+
+  const osc = ctx.createOscillator();
+  osc.type = "sawtooth";
+  osc.frequency.setValueAtTime(780, t);
+  osc.frequency.exponentialRampToValueAtTime(110, t + 0.55);
+
+  const bp = ctx.createBiquadFilter();
+  bp.type = "bandpass";
+  bp.frequency.setValueAtTime(1200, t);
+  bp.frequency.exponentialRampToValueAtTime(420, t + 0.55);
+  bp.Q.value = 6;
+
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(0.001, t);
+  g.gain.exponentialRampToValueAtTime(0.9, t + 0.03);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.62);
+
+  const noiseBuf = ctx.createBuffer(1, ctx.sampleRate * 0.25, ctx.sampleRate);
+  const ch = noiseBuf.getChannelData(0);
+  for (let i=0;i<ch.length;i++) ch[i] = (Math.random()*2-1) * (1 - i/ch.length);
+
+  const noise = ctx.createBufferSource();
+  noise.buffer = noiseBuf;
+
+  const nlp = ctx.createBiquadFilter();
+  nlp.type = "lowpass";
+  nlp.frequency.value = 2200;
+
+  const ng = ctx.createGain();
+  ng.gain.setValueAtTime(0.001, t);
+  ng.gain.exponentialRampToValueAtTime(0.7, t + 0.01);
+  ng.gain.exponentialRampToValueAtTime(0.001, t + 0.25);
+
+  osc.connect(bp).connect(g).connect(audio.master);
+  noise.connect(nlp).connect(ng).connect(audio.master);
+
+  osc.start(t);
+  noise.start(t);
+  osc.stop(t + 0.7);
+  noise.stop(t + 0.3);
+}
+function tickSteps(velLen, isRunning) {
+  const ctx = audio.ctx;
+  const t = ctx.currentTime;
+  const moving = velLen > 0.55;
+  if (!moving) return;
+
+  const interval = isRunning ? audio.step.run : audio.step.walk;
+  if ((t - audio.step.lastT) < interval) return;
+  audio.step.lastT = t;
+
+  steps += 1;
+  ui.steps.textContent = String(steps);
+
+  const osc = ctx.createOscillator();
+  osc.type = "sine";
+  osc.frequency.value = isRunning ? 110 : 90;
+
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(0.001, t);
+  g.gain.exponentialRampToValueAtTime(isRunning ? 0.32 : 0.20, t + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.10);
+
+  const lp = ctx.createBiquadFilter();
+  lp.type = "lowpass";
+  lp.frequency.value = isRunning ? 700 : 520;
+
+  osc.connect(lp).connect(g).connect(audio.master);
+  osc.start(t);
+  osc.stop(t + 0.12);
+}
+
+async function loadScareImage() {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => resolve(img.src);
+    img.onerror = () => {
+      const c = document.createElement("canvas");
+      c.width = 320; c.height = 320;
+      const g = c.getContext("2d");
+      g.fillStyle = "#000"; g.fillRect(0,0,320,320);
+      g.fillStyle = "#fff";
+      g.fillRect(80,110,60,60);
+      g.fillRect(180,110,60,60);
+      g.fillRect(120,220,80,18);
+      g.fillStyle = "#000";
+      g.fillRect(98,132,24,10);
+      g.fillRect(198,132,24,10);
+      g.fillRect(150,225,20,8);
+      resolve(c.toDataURL("image/png"));
+    };
+    img.src = ASSETS.face;
+  });
+}
+
+/* -----------------------------
+   THREE / WORLD
+-------------------------------- */
+let renderer, scene, camera, controls;
+const clock = new THREE.Clock();
+
+const worldOctree = new Octree();
+let houseRoot = null;
+let houseBox = new THREE.Box3();
+let houseSize = new THREE.Vector3();
+let houseCenter = new THREE.Vector3();
+
+const input = { fwd:0, back:0, left:0, right:0, run:false, jump:false, use:false };
+
+let sigils = [];
+let exitDoor = null;
+let exitOpen = false;
+
+let steps = 0;
+
+// Player physics (Capsule + Octree)
+const player = {
+  collider: new Capsule(new THREE.Vector3(0, 0.35, 0), new THREE.Vector3(0, 1.65, 0), 0.35),
+  velocity: new THREE.Vector3(),
+  direction: new THREE.Vector3(),
+  onGround: false,
+  alive: true,
+};
+
+// Stalker (простая погоня)
+const stalker = {
+  mesh: null,
+  active: false,
+  wakeAt: 14.0,
+  speed: 1.35
+};
+
+function initThree() {
+  renderer = new THREE.WebGLRenderer({ antialias:true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  document.body.appendChild(renderer.domElement);
+
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x000000);
+  scene.fog = new THREE.FogExp2(0x000000, 0.06);
+
+  camera = new THREE.PerspectiveCamera(72, window.innerWidth/window.innerHeight, 0.05, 200);
+  camera.position.set(0, 1.7, 0);
+
+  controls = new PointerLockControls(camera, document.body);
+  scene.add(controls.getObject());
+
+  const amb = new THREE.AmbientLight(0xffffff, 0.10);
+  scene.add(amb);
+
+  const flashlight = new THREE.SpotLight(0xffffff, 1.55, 20, Math.PI/7, 0.45, 1.2);
+  flashlight.position.set(0, 1.7, 0);
+  flashlight.target.position.set(0, 1.7, -1);
+  controls.getObject().add(flashlight);
+  controls.getObject().add(flashlight.target);
+
+  window.addEventListener("resize", onResize);
+}
+
+function onResize() {
+  camera.aspect = window.innerWidth/window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+function bindInput() {
+  window.addEventListener("keydown", (e) => {
+    if (e.code === "KeyW") input.fwd = 1;
+    if (e.code === "KeyS") input.back = 1;
+    if (e.code === "KeyA") input.left = 1;
+    if (e.code === "KeyD") input.right = 1;
+    if (e.code === "ShiftLeft" || e.code === "ShiftRight") input.run = true;
+    if (e.code === "Space") input.jump = true;
+    if (e.code === "KeyE") input.use = true;
+  });
+  window.addEventListener("keyup", (e) => {
+    if (e.code === "KeyW") input.fwd = 0;
+    if (e.code === "KeyS") input.back = 0;
+    if (e.code === "KeyA") input.left = 0;
+    if (e.code === "KeyD") input.right = 0;
+    if (e.code === "ShiftLeft" || e.code === "ShiftRight") input.run = false;
+    if (e.code === "Space") input.jump = false;
+  });
+
+  ui.hint.addEventListener("click", startGame);
+
+  controls.addEventListener("unlock", () => {
+    if (player.alive) ui.hint.style.display = "block";
+  });
+  controls.addEventListener("lock", () => {
+    ui.hint.style.display = "none";
+  });
+}
+
+async function startGame() {
+  if (!audio.unlocked) {
+    initAudio();
+    audio.unlocked = true;
+
+    setState("звук…");
+    let ambBuf = null;
+    try { ambBuf = await tryLoadAudioBuffer(ASSETS.ambience); } catch {}
+    if (ambBuf) audio.ambienceNode = playBuffer(ambBuf, { loop:true, gain:0.42 });
+    else audio.ambienceNode = startSynthAmbience();
+
+    try { audio.screamBuf = await tryLoadAudioBuffer(ASSETS.scream); } catch { audio.screamBuf = null; }
+    ui.scareImg.src = await loadScareImage();
+  }
+
+  if (!houseRoot) {
+    // защита: если модель еще грузится
+    return;
+  }
+
+  ui.hint.style.display = "none";
+  controls.lock();
+  setState("живой");
+}
+
+function openExit() {
+  exitOpen = true;
+  if (exitDoor?.userData?.lockLight) {
+    exitDoor.userData.lockLight.color.setHex(0x00ff66);
+    exitDoor.userData.lockLight.intensity = 0.75;
+  }
+}
+
+function showEndScreen(html) {
+  ui.hint.style.display = "block";
+  ui.hint.innerHTML = `<b>${html}</b><br><br><a href="#" id="restart">Рестарт</a>`;
+  document.getElementById("restart").onclick = (e) => { e.preventDefault(); location.reload(); };
+}
+
+function triggerJumpscare() {
+  if (!player.alive) return;
+  player.alive = false;
+
+  ui.jumpscare.style.display = "grid";
+  setState("поздно");
+
+  if (audio.ctx) {
+    try { audio.master.gain.setTargetAtTime(0.70, audio.ctx.currentTime, 0.02); } catch {}
+    stopNode(audio.ambienceNode);
+    if (audio.screamBuf) playBuffer(audio.screamBuf, { loop:false, gain:1.0 });
+    else playSynthScream();
+  }
+
+  setTimeout(() => {
+    ui.jumpscare.style.display = "none";
+    showEndScreen(`Тебя выключили.<br><span style="opacity:.85">Собрано сигилов: ${collected}/3</span>`);
+    controls.unlock();
+  }, 950);
+}
+
+/* -----------------------------
+   Load House + Build Colliders
+-------------------------------- */
+const loader = new GLTFLoader();
+let collected = 0;
+
+async function loadHouse() {
+  setState("загрузка дома…");
+
+  const gltf = await loader.loadAsync(ASSETS.house);
+
+  houseRoot = gltf.scene;
+  scene.add(houseRoot);
+
+  // базовая оптимизация материалов/тени
+  houseRoot.traverse((o) => {
+    if (o.isMesh) {
+      o.castShadow = false;
+      o.receiveShadow = false;
+      if (o.material) {
+        o.material.side = THREE.FrontSide;
+      }
+    }
+  });
+
+  // авто-центрирование + масштаб под игру
+  houseBox.setFromObject(houseRoot);
+  houseBox.getSize(houseSize);
+  houseBox.getCenter(houseCenter);
+
+  const maxDim = Math.max(houseSize.x, houseSize.y, houseSize.z);
+  const target = 28; // "игровой" размер
+  const scale = (maxDim > 0.0001) ? (target / maxDim) : 1;
+
+  houseRoot.scale.setScalar(scale);
+  houseRoot.position.sub(houseCenter.multiplyScalar(scale));
+
+  // обновим box после трансформаций
+  houseRoot.updateWorldMatrix(true, true);
+  houseBox.setFromObject(houseRoot);
+  houseBox.getSize(houseSize);
+  houseBox.getCenter(houseCenter);
+
+  // коллизии: создаём группу коллайдеров из "крупных" мешей (мелочь игнорируем, чтобы не застревать на мусоре)
+  const colliderGroup = new THREE.Group();
+  const tmpBox = new THREE.Box3();
+  const tmpSize = new THREE.Vector3();
+
+  houseRoot.traverse((o) => {
+    if (!o.isMesh || !o.geometry) return;
+
+    // bounding-box в world
+    tmpBox.setFromObject(o);
+    tmpBox.getSize(tmpSize);
+
+    const maxD = Math.max(tmpSize.x, tmpSize.y, tmpSize.z);
+
+    // фильтр: мелкие объекты (книги/ключи/посуду) выкидываем
+    if (maxD < 0.75) return;
+
+    const geom = o.geometry.clone();
+    // запекаем в world координаты
+    geom.applyMatrix4(o.matrixWorld);
+
+    const m = new THREE.Mesh(geom);
+    m.visible = false;
+    colliderGroup.add(m);
+  });
+
+  worldOctree.fromGraphNode(colliderGroup);
+
+  // точки игры внутри дома (по bbox)
+  spawnGameplay();
+
+  setState("готово");
+}
+
+function spawnGameplay() {
+  // старт: чуть выше пола, ближе к центру
+  const spawn = houseCenter.clone().add(new THREE.Vector3(0, 2.0, 0));
+  player.collider.start.copy(spawn).add(new THREE.Vector3(0, -1.3, 0));
+  player.collider.end.copy(spawn).add(new THREE.Vector3(0, 0.0, 0));
+  player.velocity.set(0, 0, 0);
+  teleportToCollider();
+
+  // сигилы
+  const sigilPositions = [
+    houseCenter.clone().add(new THREE.Vector3( houseSize.x*0.22, 1.2,  houseSize.z*0.18)),
+    houseCenter.clone().add(new THREE.Vector3(-houseSize.x*0.24, 1.2, -houseSize.z*0.15)),
+    houseCenter.clone().add(new THREE.Vector3( 0,               1.2, -houseSize.z*0.30)),
+  ];
+  const sigGeo = new THREE.IcosahedronGeometry(0.22, 0);
+  const sigMat = new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0x303030, roughness: 0.2, metalness: 0.0 });
+
+  sigils = sigilPositions.map((p) => {
+    const mesh = new THREE.Mesh(sigGeo, sigMat);
+    mesh.position.copy(p);
+    scene.add(mesh);
+
+    const halo = new THREE.PointLight(0xffffff, 0.45, 3.8);
+    halo.position.copy(p);
+    scene.add(halo);
+
+    return { mesh, halo, t: Math.random()*10, taken:false };
+  });
+
+  // дверь выхода (условная): плоскость + индикатор
+  const doorGeo = new THREE.BoxGeometry(1.0, 2.2, 0.15);
+  const doorMat = new THREE.MeshStandardMaterial({ color: 0x0e0e0e, roughness: 1.0 });
+  exitDoor = new THREE.Mesh(doorGeo, doorMat);
+  exitDoor.position.copy(houseCenter.clone().add(new THREE.Vector3(0, 1.1, houseSize.z*0.46)));
+  scene.add(exitDoor);
+
+  const lockLight = new THREE.PointLight(0xff0000, 0.65, 3.0);
+  lockLight.position.copy(exitDoor.position).add(new THREE.Vector3(0, 0.55, 0.45));
+  scene.add(lockLight);
+  exitDoor.userData.lockLight = lockLight;
+
+  // сталкер
+  const stalkGeo = new THREE.CapsuleGeometry(0.32, 1.0, 4, 8);
+  const stalkMat = new THREE.MeshStandardMaterial({ color: 0x000000, roughness: 1.0 });
+  stalker.mesh = new THREE.Mesh(stalkGeo, stalkMat);
+  stalker.mesh.position.copy(houseCenter.clone().add(new THREE.Vector3(houseSize.x*0.42, 1.0, -houseSize.z*0.42)));
+  scene.add(stalker.mesh);
+
+  const eye = new THREE.PointLight(0xffffff, 0.09, 2.0);
+  eye.position.set(0, 1.2, 0.25);
+  stalker.mesh.add(eye);
+}
+
+/* -----------------------------
+   Player movement + collisions
+-------------------------------- */
+function getForwardVector() {
+  controls.getDirection(player.direction);
+  player.direction.y = 0;
+  player.direction.normalize();
+  return player.direction;
+}
+function getSideVector() {
+  controls.getDirection(player.direction);
+  player.direction.y = 0;
+  player.direction.normalize();
+  player.direction.cross(camera.up);
+  return player.direction;
+}
+function teleportToCollider() {
+  const pos = player.collider.end;
+  controls.getObject().position.copy(pos);
+}
+function playerCollisions() {
+  const result = worldOctree.capsuleIntersect(player.collider);
+  player.onGround = false;
+
+  if (result) {
+    player.onGround = result.normal.y > 0;
+    if (!player.onGround) {
+      player.velocity.addScaledVector(result.normal, -result.normal.dot(player.velocity));
+    }
+    player.collider.translate(result.normal.multiplyScalar(result.depth));
+  }
+}
+
+function updatePlayer(dt) {
+  if (!player.alive) return;
+
+  let damping = Math.exp(-4 * dt) - 1;
+
+  if (!player.onGround) {
+    player.velocity.y -= 25 * dt; // gravity
+    damping *= 0.1;
+  }
+
+  player.velocity.addScaledVector(player.velocity, damping);
+
+  const speed = input.run ? 9.0 : 5.0;
+
+  if (input.fwd)   player.velocity.add(getForwardVector().multiplyScalar(speed * dt));
+  if (input.back)  player.velocity.add(getForwardVector().multiplyScalar(-speed * dt));
+  if (input.left)  player.velocity.add(getSideVector().multiplyScalar(-speed * dt));
+  if (input.right) player.velocity.add(getSideVector().multiplyScalar(speed * dt));
+
+  if (player.onGround && input.jump) {
+    player.velocity.y = 9.0;
+  }
+
+  const deltaPos = player.velocity.clone().multiplyScalar(dt);
+  player.collider.translate(deltaPos);
+
+  playerCollisions();
+  teleportToCollider();
+
+  // шаги по скорости на плоскости
+  if (audio.ctx) {
+    const planar = Math.hypot(player.velocity.x, player.velocity.z);
+    tickSteps(planar, input.run);
+  }
+
+  // не даём выйти за bbox дома (страховка)
+  const p = controls.getObject().position;
+  p.x = Math.min(houseBox.max.x - 0.3, Math.max(houseBox.min.x + 0.3, p.x));
+  p.z = Math.min(houseBox.max.z - 0.3, Math.max(houseBox.min.z + 0.3, p.z));
+  controls.getObject().position.copy(p);
+  player.collider.end.copy(p);
+  player.collider.start.copy(p).add(new THREE.Vector3(0, -1.3, 0));
+}
+
+function updateSigils(dt) {
+  const p = controls.getObject().position;
+
+  for (const s of sigils) {
+    if (s.taken) continue;
+
+    s.t += dt;
+    const pulse = 0.6 + Math.sin(s.t*3.2)*0.4;
+    s.mesh.scale.setScalar(0.95 + pulse*0.22);
+    s.mesh.rotation.y += dt*1.25;
+    s.halo.intensity = 0.18 + pulse*0.35;
+
+    if (input.use) {
+      const d = s.mesh.position.distanceTo(p);
+      if (d < 1.1) {
+        s.taken = true;
+        s.mesh.visible = false;
+        s.halo.visible = false;
+
+        collected += 1;
+        ui.sigils.textContent = String(collected);
+
+        if (collected === 3) {
+          setState("замок дрогнул");
+          openExit();
+        } else {
+          setState("что-то шепчет");
+        }
+      }
+    }
+  }
+  input.use = false;
+}
+
+function updateExit(dt) {
+  if (!exitDoor) return;
+
+  if (!exitOpen) {
+    const t = performance.now() * 0.001;
+    exitDoor.userData.lockLight.intensity = 0.50 + Math.sin(t*4.0)*0.18;
+    return;
+  }
+
+  if (exitDoor.position.y < 3.2) {
+    exitDoor.position.y += dt * 1.4;
+    return;
+  }
+
+  // выход
+  const p = controls.getObject().position;
+  const d = exitDoor.position.distanceTo(p);
+  if (d < 1.6 && player.alive) {
+    player.alive = false;
+    setState("вышел");
+    showEndScreen(`Ты вышел.<br><span style="opacity:.85">Сигилы: ${collected}/3</span>`);
+    controls.unlock();
+  }
+}
+
+function updateStalker(dt, elapsed) {
+  if (!stalker.mesh || !player.alive) return;
+
+  if (!stalker.active && elapsed >= stalker.wakeAt) {
+    stalker.active = true;
+    setState("кто-то рядом");
+  }
+  if (!stalker.active) return;
+
+  const p = controls.getObject().position;
+  const s = stalker.mesh.position;
+
+  const toP = new THREE.Vector3(p.x - s.x, 0, p.z - s.z);
+  const dist = toP.length();
+
+  const spd = stalker.speed * (dist > 10 ? 1.25 : 1.0);
+
+  if (dist > 0.001) {
+    toP.normalize();
+    s.x += toP.x * spd * dt;
+    s.z += toP.z * spd * dt;
+  }
+  stalker.mesh.lookAt(p.x, 1.0, p.z);
+
+  if (dist < 1.25) triggerJumpscare();
+}
+
+function flicker() {
+  const t = performance.now() * 0.001;
+  const trem = (Math.sin(t*13.0) + Math.sin(t*7.0 + 1.7)) * 0.5;
+  const panic = stalker.active ? 0.018 : 0.010;
+  scene.fog.density = 0.06 + Math.max(0, trem) * panic;
+  camera.fov = 72 + (stalker.active ? (Math.max(0, trem) * 2.2) : (Math.max(0, trem) * 1.0));
+  camera.updateProjectionMatrix();
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.033);
+  const elapsed = clock.elapsedTime;
+
+  if (controls.isLocked && player.alive) {
+    updatePlayer(dt);
+    updateSigils(dt);
+    updateExit(dt);
+    updateStalker(dt, elapsed);
+    flicker();
+  }
+
+  renderer.render(scene, camera);
+}
+
+/* -----------------------------
+   Boot
+-------------------------------- */
+initThree();
+bindInput();
+setState("загрузка…");
+ui.scareImg.src = await loadScareImage();
+await loadHouse();
+setState("кликни, чтобы начать");
+animate();
+</script>
+</body>
+</html>
